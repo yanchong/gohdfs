@@ -9,7 +9,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/colinmarc/hdfs"
+	"github.com/yanchong/gohdfs"
 )
 
 var (
