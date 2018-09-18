@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	hadoop "github.com/yanchong/gohdfs/protocol/hadoop_common"
 	"github.com/golang/protobuf/proto"
+	hadoop "github.com/yanchong/gohdfs/protocol/hadoop_common"
 )
 
 const (
@@ -160,7 +160,14 @@ func (c *NamenodeConnection) resolveConnection() error {
 		}
 
 		c.host = host
-		c.conn, err = net.DialTimeout("tcp", host.address, connectTimeout)
+		for errCount := 0; errCount < 10; errCount = errCount + 1 {
+			c.conn, err = net.DialTimeout("tcp", host.address, connectTimeout)
+			if err != nil {
+				time.Sleep(time.Duration(errCount) * time.Second)
+			} else {
+				break
+			}
+		}
 		if err != nil {
 			c.markFailure(err)
 			continue
