@@ -4,13 +4,14 @@ import (
 	"errors"
 	"os"
 
-	hdfs "github.com/yanchong/gohdfs/internal/protocol/hadoop_hdfs"
 	"github.com/golang/protobuf/proto"
+	hdfs "github.com/yanchong/gohdfs/internal/protocol/hadoop_hdfs"
 )
 
 // Remove removes the named file or (empty) directory.
 func (c *Client) Remove(name string) error {
-	return delete(c, name, false)
+	//return delete(c, name, false)
+	return delete(c, name, true)
 }
 
 // RemoveAll removes path and any children it contains. It removes everything it

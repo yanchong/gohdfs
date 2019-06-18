@@ -178,6 +178,20 @@ func New(address string) (*Client, error) {
 	return NewClient(options)
 }
 
+// Username returns the value of HADOOP_USER_NAME in the environment, or
+// the current system user if it is not set.
+func Username() (string, error) {
+	username := os.Getenv("HADOOP_USER_NAME")
+	if username != "" {
+		return username, nil
+	}
+	currentUser, err := user.Current()
+	if err != nil {
+		return "", err
+	}
+	return currentUser.Username, nil
+}
+
 // User returns the user that the Client is acting under. This is either the
 // current system user or the kerberos principal.
 func (c *Client) User() string {
