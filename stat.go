@@ -5,8 +5,7 @@ import (
 	"path"
 	"time"
 
-	hdfs "github.com/yanchong/gohdfs/protocol/hadoop_hdfs"
-	"github.com/yanchong/gohdfs/rpc"
+	hdfs "github.com/yanchong/gohdfs/internal/protocol/hadoop_hdfs"
 	"github.com/golang/protobuf/proto"
 )
 
@@ -21,7 +20,7 @@ type FileInfo struct {
 func (c *Client) Stat(name string) (os.FileInfo, error) {
 	fi, err := c.getFileInfo(name)
 	if err != nil {
-		err = &os.PathError{"stat", name, err}
+		err = &os.PathError{"stat", name, interpretException(err)}
 	}
 
 	return fi, err
@@ -33,10 +32,6 @@ func (c *Client) getFileInfo(name string) (os.FileInfo, error) {
 
 	err := c.namenode.Execute("getFileInfo", req, resp)
 	if err != nil {
-		if nnErr, ok := err.(*rpc.NamenodeError); ok {
-			err = interpretException(nnErr.Exception, err)
-		}
-
 		return nil, err
 	}
 
@@ -79,7 +74,7 @@ func (fi *FileInfo) Mode() os.FileMode {
 }
 
 func (fi *FileInfo) ModTime() time.Time {
-	return time.Unix(int64(fi.status.GetModificationTime())/1000, 0)
+	return time.Unix(0, int64(fi.status.GetModificationTime())*int64(time.Millisecond))
 }
 
 func (fi *FileInfo) IsDir() bool {

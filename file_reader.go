@@ -6,9 +6,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
-	hdfs "github.com/yanchong/gohdfs/protocol/hadoop_hdfs"
-	"github.com/yanchong/gohdfs/rpc"
+	hdfs "github.com/yanchong/gohdfs/internal/protocol/hadoop_hdfs"
+	"github.com/yanchong/gohdfs/internal/rpc"
 	"github.com/golang/protobuf/proto"
 )
 
@@ -22,6 +23,7 @@ type FileReader struct {
 
 	blocks      []*hdfs.LocatedBlockProto
 	blockReader *rpc.BlockReader
+	deadline    time.Time
 	offset      int64
 
 	readdirLast string
@@ -33,7 +35,7 @@ type FileReader struct {
 func (c *Client) Open(name string) (*FileReader, error) {
 	info, err := c.getFileInfo(name)
 	if err != nil {
-		return nil, &os.PathError{"open", name, err}
+		return nil, &os.PathError{"open", name, interpretException(err)}
 	}
 
 	return &FileReader{
@@ -52,6 +54,18 @@ func (f *FileReader) Name() string {
 // Stat returns the FileInfo structure describing file.
 func (f *FileReader) Stat() os.FileInfo {
 	return f.info
+}
+
+// SetDeadline sets the deadline for future Read, ReadAt, and Checksum calls. A
+// zero value for t means those calls will not time out.
+func (f *FileReader) SetDeadline(t time.Time) error {
+	f.deadline = t
+	if f.blockReader != nil {
+		return f.blockReader.SetDeadline(t)
+	}
+
+	// Return the error at connection time.
+	return nil
 }
 
 // Checksum returns HDFS's internal "MD5MD5CRC32C" checksum for a given file.
@@ -75,16 +89,25 @@ func (f *FileReader) Checksum() ([]byte, error) {
 		}
 	}
 
-	// The way the hadoop code calculates this, it writes all the checksums out to
-	// a byte array, which is automatically padded with zeroes out to the next
-	// power of 2 (with a minimum of 32)... and then takes the MD5 of that array,
-	// including the zeroes. This is pretty shady business, but we want to track
+	// Hadoop calculates this by writing the checksums out to a byte array, which
+	// is automatically padded with zeroes out to the next  power of 2
+	// (with a minimum of 32)... and then takes the MD5 of that array, including
+	// the zeroes. This is pretty shady business, but we want to track
 	// the 'hadoop fs -checksum' behavior if possible.
 	paddedLength := 32
 	totalLength := 0
 	checksum := md5.New()
 	for _, block := range f.blocks {
-		cr := rpc.NewChecksumReader(block)
+		cr := &rpc.ChecksumReader{
+			Block:               block,
+			UseDatanodeHostname: f.client.options.UseDatanodeHostname,
+			DialFunc:            f.client.options.DatanodeDialFunc,
+		}
+
+		err := cr.SetDeadline(f.deadline)
+		if err != nil {
+			return nil, err
+		}
 
 		blockChecksum, err := cr.ReadChecksum()
 		if err != nil {
@@ -118,11 +141,11 @@ func (f *FileReader) Seek(offset int64, whence int) (int64, error) {
 	} else if whence == 2 {
 		off = f.info.Size() + offset
 	} else {
-		return f.offset, fmt.Errorf("Invalid whence: %d", whence)
+		return f.offset, fmt.Errorf("invalid whence: %d", whence)
 	}
 
 	if off < 0 || off > f.info.Size() {
-		return f.offset, fmt.Errorf("Invalid resulting offset: %d", off)
+		return f.offset, fmt.Errorf("invalid resulting offset: %d", off)
 	}
 
 	if f.offset != off {
@@ -151,6 +174,10 @@ func (f *FileReader) Read(b []byte) (int, error) {
 
 	if f.offset >= f.info.Size() {
 		return 0, io.EOF
+	}
+
+	if len(b) == 0 {
+		return 0, nil
 	}
 
 	if f.blocks == nil {
@@ -190,12 +217,24 @@ func (f *FileReader) ReadAt(b []byte, off int64) (int, error) {
 		return 0, io.ErrClosedPipe
 	}
 
+	if off < 0 {
+		return 0, &os.PathError{"readat", f.name, errors.New("negative offset")}
+	}
+
 	_, err := f.Seek(off, 0)
 	if err != nil {
 		return 0, err
 	}
 
-	return io.ReadFull(f, b)
+	n, err := io.ReadFull(f, b)
+
+	// For some reason, os.File.ReadAt returns io.EOF in this case instead of
+	// io.ErrUnexpectedEOF.
+	if err == io.ErrUnexpectedEOF {
+		err = io.EOF
+	}
+
+	return n, err
 }
 
 // Readdir reads the contents of the directory associated with file and returns
@@ -212,6 +251,15 @@ func (f *FileReader) ReadAt(b []byte, off int64) (int, error) {
 // the directory), it returns the slice and a nil error. If it encounters an
 // error before the end of the directory, Readdir returns the os.FileInfo read
 // until that point and a non-nil error.
+//
+// The os.FileInfo values returned will not have block location attached to
+// the struct returned by Sys(). To fetch that information, make a separate
+// call to Stat.
+//
+// Note that making multiple calls to Readdir with a smallish n (as you might do
+// with the os version) is slower than just requesting everything at once.
+// That's because HDFS has no mechanism for limiting the number of entries
+// returned; whatever extra entries it returns are simply thrown away.
 func (f *FileReader) Readdir(n int) ([]os.FileInfo, error) {
 	if f.closed {
 		return nil, io.ErrClosedPipe
@@ -229,20 +277,60 @@ func (f *FileReader) Readdir(n int) ([]os.FileInfo, error) {
 		f.readdirLast = ""
 	}
 
-	res, err := f.client.getDirList(f.name, f.readdirLast, n)
-	if err != nil {
-		return res, err
+	res := make([]os.FileInfo, 0)
+	for {
+		batch, remaining, err := f.readdir()
+		if err != nil {
+			return nil, &os.PathError{"readdir", f.name, interpretException(err)}
+		}
+
+		if len(batch) > 0 {
+			f.readdirLast = batch[len(batch)-1].Name()
+		}
+
+		res = append(res, batch...)
+		if remaining == 0 || (n > 0 && len(res) >= n) {
+			break
+		}
 	}
 
 	if n > 0 {
 		if len(res) == 0 {
-			err = io.EOF
-		} else {
+			return nil, io.EOF
+		}
+
+		if len(res) > n {
+			res = res[:n]
 			f.readdirLast = res[len(res)-1].Name()
 		}
 	}
 
-	return res, err
+	return res, nil
+}
+
+func (f *FileReader) readdir() ([]os.FileInfo, int, error) {
+	req := &hdfs.GetListingRequestProto{
+		Src:          proto.String(f.name),
+		StartAfter:   []byte(f.readdirLast),
+		NeedLocation: proto.Bool(false),
+	}
+	resp := &hdfs.GetListingResponseProto{}
+
+	err := f.client.namenode.Execute("getListing", req, resp)
+	if err != nil {
+		return nil, 0, err
+	} else if resp.GetDirList() == nil {
+		return nil, 0, os.ErrNotExist
+	}
+
+	list := resp.GetDirList().GetPartialListing()
+	res := make([]os.FileInfo, 0, len(list))
+	for _, status := range list {
+		res = append(res, newFileInfo(status, ""))
+	}
+
+	remaining := int(resp.GetDirList().GetRemainingEntries())
+	return res, remaining, nil
 }
 
 // Readdirnames reads and returns a slice of names from the directory f.
@@ -309,12 +397,17 @@ func (f *FileReader) getNewBlockReader() error {
 		end := start + block.GetB().GetNumBytes()
 
 		if start <= off && off < end {
-			br := rpc.NewBlockReader(block, int64(off-start), f.client.namenode.ClientName())
+			f.blockReader = &rpc.BlockReader{
+				ClientName:          f.client.namenode.ClientName,
+				Block:               block,
+				Offset:              int64(off - start),
+				UseDatanodeHostname: f.client.options.UseDatanodeHostname,
+				DialFunc:            f.client.options.DatanodeDialFunc,
+			}
 
-			f.blockReader = br
-			return nil
+			return f.SetDeadline(f.deadline)
 		}
 	}
 
-	return fmt.Errorf("Couldn't find block for offset: %d", off)
+	return errors.New("invalid offset")
 }

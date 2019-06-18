@@ -4,13 +4,28 @@ import (
 	"errors"
 	"os"
 
-	hdfs "github.com/yanchong/gohdfs/protocol/hadoop_hdfs"
-	"github.com/yanchong/gohdfs/rpc"
+	hdfs "github.com/yanchong/gohdfs/internal/protocol/hadoop_hdfs"
 	"github.com/golang/protobuf/proto"
 )
 
-// Remove removes the named file or directory.
+// Remove removes the named file or (empty) directory.
 func (c *Client) Remove(name string) error {
+	return delete(c, name, false)
+}
+
+// RemoveAll removes path and any children it contains. It removes everything it
+// can but returns the first error it encounters. If the path does not exist,
+// RemoveAll returns nil (no error).
+func (c *Client) RemoveAll(name string) error {
+	err := delete(c, name, true)
+	if os.IsNotExist(err) {
+		return nil
+	}
+
+	return err
+}
+
+func delete(c *Client, name string, recursive bool) error {
 	_, err := c.getFileInfo(name)
 	if err != nil {
 		return &os.PathError{"remove", name, err}
@@ -18,22 +33,18 @@ func (c *Client) Remove(name string) error {
 
 	req := &hdfs.DeleteRequestProto{
 		Src:       proto.String(name),
-		Recursive: proto.Bool(true),
+		Recursive: proto.Bool(recursive),
 	}
 	resp := &hdfs.DeleteResponseProto{}
 
 	err = c.namenode.Execute("delete", req, resp)
 	if err != nil {
-		if nnErr, ok := err.(*rpc.NamenodeError); ok {
-			err = interpretException(nnErr.Exception, err)
-		}
-
-		return &os.PathError{"remove", name, err}
+		return &os.PathError{"remove", name, interpretException(err)}
 	} else if resp.Result == nil {
 		return &os.PathError{
 			"remove",
 			name,
-			errors.New("Unexpected empty response to 'delete' rpc call"),
+			errors.New("unexpected empty response"),
 		}
 	}
 

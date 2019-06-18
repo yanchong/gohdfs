@@ -3,6 +3,7 @@ package hdfs
 import (
 	"bytes"
 	"encoding/hex"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"io/ioutil"
@@ -100,6 +101,17 @@ func TestFileBigReadN(t *testing.T) {
 	assert.EqualValues(t, n, 1000000)
 }
 
+func TestFileReadNil(t *testing.T) {
+	client := getClient(t)
+
+	file, err := client.Open("/_test/mobydick.txt")
+	require.NoError(t, err)
+
+	n, err := file.Read(nil)
+	assert.NoError(t, err)
+	assert.EqualValues(t, n, 0)
+}
+
 func TestFileReadAt(t *testing.T) {
 	client := getClient(t)
 
@@ -127,6 +139,18 @@ func TestFileReadAt(t *testing.T) {
 	}
 
 	assert.EqualValues(t, testStr2, string(buf))
+}
+
+func TestFileReadAtEOF(t *testing.T) {
+	client := getClient(t)
+
+	file, err := client.Open("/_test/foo.txt")
+	require.NoError(t, err)
+
+	buf := make([]byte, 10)
+	_, err = file.ReadAt(buf, 1)
+
+	assert.Equal(t, err, io.EOF)
 }
 
 func TestFileSeek(t *testing.T) {
@@ -172,7 +196,7 @@ func TestFileSeek(t *testing.T) {
 func TestFileReadDir(t *testing.T) {
 	client := getClient(t)
 
-	mkdirp(t, "/_test/fulldir3")
+	baleet(t, "/_test/fulldir3")
 	mkdirp(t, "/_test/fulldir3/dir")
 	touch(t, "/_test/fulldir3/1")
 	touch(t, "/_test/fulldir3/2")
@@ -202,7 +226,7 @@ func TestFileReadDir(t *testing.T) {
 func TestFileReadDirnames(t *testing.T) {
 	client := getClient(t)
 
-	mkdirp(t, "/_test/fulldir4")
+	baleet(t, "/_test/fulldir4")
 	mkdirp(t, "/_test/fulldir4/dir")
 	touch(t, "/_test/fulldir4/1")
 	touch(t, "/_test/fulldir4/2")
@@ -216,15 +240,49 @@ func TestFileReadDirnames(t *testing.T) {
 	assert.EqualValues(t, []string{"1", "2", "3", "dir"}, res)
 }
 
+func TestFileReadDirMany(t *testing.T) {
+	client := getClient(t)
+
+	maxReadDir := 1000 // HDFS returns this many entries.
+	total := maxReadDir*2 + maxReadDir/2 + 35
+	firstBatch := maxReadDir + 71
+
+	mkdirp(t, "/_test/fulldir5")
+	for i := 0; i < total; i++ {
+		touch(t, fmt.Sprintf("/_test/fulldir5/%04d", i))
+	}
+
+	file, err := client.Open("/_test/fulldir5")
+	require.NoError(t, err)
+
+	res, err := file.Readdir(firstBatch)
+	require.Equal(t, firstBatch, len(res))
+	for i := range res {
+		assert.EqualValues(t, fmt.Sprintf("%04d", i), res[i].Name())
+	}
+
+	res, err = file.Readdir(total)
+	assert.Equal(t, total-firstBatch, len(res))
+	for i := range res {
+		assert.EqualValues(t, fmt.Sprintf("%04d", i+firstBatch), res[i].Name())
+	}
+
+	res, err = file.Readdir(0)
+	require.Equal(t, total, len(res))
+	for i := range res {
+		assert.EqualValues(t, fmt.Sprintf("%04d", i), res[i].Name())
+	}
+}
+
 func TestOpenFileWithoutPermission(t *testing.T) {
-	otherClient := getClientForUser(t, "other")
+	client2 := getClientForUser(t, "gohdfs2")
 
-	mkdirp(t, "/_test/accessdenied")
-	touch(t, "/_test/accessdenied/foo")
+	mkdirpMask(t, "/_test/accessdenied", 0700)
+	touchMask(t, "/_test/accessdenied/foo", 0700)
 
-	file, err := otherClient.Open("/_test/accessdenied/foo")
-	assert.Nil(t, file)
+	file, err := client2.Open("/_test/accessdenied/foo")
 	assertPathError(t, err, "open", "/_test/accessdenied/foo", os.ErrPermission)
+	assert.Nil(t, file)
 }
 
 func TestFileChecksum(t *testing.T) {
@@ -237,4 +295,56 @@ func TestFileChecksum(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.EqualValues(t, testChecksum, hex.EncodeToString(checksum))
+}
+
+func TestFileReadDeadline(t *testing.T) {
+	client := getClient(t)
+
+	file, err := client.Open("/_test/foo.txt")
+	require.NoError(t, err)
+
+	file.SetDeadline(time.Now().Add(100 * time.Millisecond))
+	_, err = file.Read([]byte{0, 0})
+	assert.NoError(t, err)
+
+	time.Sleep(100 * time.Millisecond)
+	_, err = file.Read([]byte{0, 0})
+	assert.NotNil(t, err)
+}
+
+func TestFileReadDeadlineBefore(t *testing.T) {
+	client := getClient(t)
+
+	file, err := client.Open("/_test/foo.txt")
+	require.NoError(t, err)
+
+	file.SetDeadline(time.Now())
+	_, err = file.Read([]byte{0, 0})
+	assert.NotNil(t, err)
+}
+
+func TestFileChecksumDeadline(t *testing.T) {
+	client := getClient(t)
+
+	file, err := client.Open("/_test/foo.txt")
+	require.NoError(t, err)
+
+	file.SetDeadline(time.Now().Add(100 * time.Millisecond))
+	_, err = file.Checksum()
+	assert.NoError(t, err)
+
+	time.Sleep(100 * time.Millisecond)
+	_, err = file.Checksum()
+	assert.NotNil(t, err)
+}
+
+func TestFileChecksumDeadlineBefore(t *testing.T) {
+	client := getClient(t)
+
+	file, err := client.Open("/_test/foo.txt")
+	require.NoError(t, err)
+
+	file.SetDeadline(time.Now())
+	_, err = file.Checksum()
+	assert.NotNil(t, err)
 }

@@ -3,14 +3,14 @@ package hdfs
 import (
 	"os"
 
-	hdfs "github.com/yanchong/gohdfs/protocol/hadoop_hdfs"
-	"github.com/yanchong/gohdfs/rpc"
+	hdfs "github.com/yanchong/gohdfs/internal/protocol/hadoop_hdfs"
 	"github.com/golang/protobuf/proto"
 )
 
 // Rename renames (moves) a file.
 func (c *Client) Rename(oldpath, newpath string) error {
 	_, err := c.getFileInfo(newpath)
+	err = interpretException(err)
 	if err != nil && !os.IsNotExist(err) {
 		return &os.PathError{"rename", newpath, err}
 	}
@@ -24,11 +24,7 @@ func (c *Client) Rename(oldpath, newpath string) error {
 
 	err = c.namenode.Execute("rename2", req, resp)
 	if err != nil {
-		if nnErr, ok := err.(*rpc.NamenodeError); ok {
-			err = interpretException(nnErr.Exception, err)
-		}
-
-		return &os.PathError{"rename", oldpath, err}
+		return &os.PathError{"rename", oldpath, interpretException(err)}
 	}
 
 	return nil

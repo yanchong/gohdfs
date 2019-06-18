@@ -1,13 +1,8 @@
 package hdfs
 
 import (
-	"errors"
-
-	hdfs "github.com/yanchong/gohdfs/protocol/hadoop_hdfs"
-	"github.com/yanchong/gohdfs/rpc"
+	hdfs "github.com/yanchong/gohdfs/internal/protocol/hadoop_hdfs"
 )
-
-var StatFsError = errors.New("Failed to get HDFS usage")
 
 // FsInfo provides information about HDFS
 type FsInfo struct {
@@ -23,26 +18,23 @@ type FsInfo struct {
 }
 
 func (c *Client) StatFs() (FsInfo, error) {
-	req  := &hdfs.GetFsStatusRequestProto{}
+	req := &hdfs.GetFsStatusRequestProto{}
 	resp := &hdfs.GetFsStatsResponseProto{}
 
 	err := c.namenode.Execute("getFsStats", req, resp)
 	if err != nil {
-		if nnErr, ok := err.(*rpc.NamenodeError); ok {
-			err = interpretException(nnErr.Exception, err)
-		}
 		return FsInfo{}, err
 	}
 
 	var fs FsInfo
-	fs.Capacity              = resp.GetCapacity()
-	fs.Used                  = resp.GetUsed()
-	fs.Remaining             = resp.GetRemaining()
-	fs.UnderReplicated       = resp.GetUnderReplicated()
-	fs.CorruptBlocks         = resp.GetCorruptBlocks()
-	fs.MissingBlocks         = resp.GetMissingBlocks()
-	fs.MissingReplOneBlocks  = resp.GetMissingReplOneBlocks()
-	fs.BlocksInFuture        = resp.GetBlocksInFuture()
+	fs.Capacity = resp.GetCapacity()
+	fs.Used = resp.GetUsed()
+	fs.Remaining = resp.GetRemaining()
+	fs.UnderReplicated = resp.GetUnderReplicated()
+	fs.CorruptBlocks = resp.GetCorruptBlocks()
+	fs.MissingBlocks = resp.GetMissingBlocks()
+	fs.MissingReplOneBlocks = resp.GetMissingReplOneBlocks()
+	fs.BlocksInFuture = resp.GetBlocksInFuture()
 	fs.PendingDeletionBlocks = resp.GetPendingDeletionBlocks()
 
 	return fs, nil

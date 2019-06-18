@@ -3,9 +3,10 @@ package hdfs
 import (
 	"io"
 	"os"
+	"time"
 
-	hdfs "github.com/yanchong/gohdfs/protocol/hadoop_hdfs"
-	"github.com/yanchong/gohdfs/rpc"
+	hdfs "github.com/yanchong/gohdfs/internal/protocol/hadoop_hdfs"
+	"github.com/yanchong/gohdfs/internal/rpc"
 	"github.com/golang/protobuf/proto"
 )
 
@@ -18,8 +19,8 @@ type FileWriter struct {
 	replication int
 	blockSize   int64
 
-	block       *hdfs.LocatedBlockProto
 	blockWriter *rpc.BlockWriter
+	deadline    time.Time
 	closed      bool
 }
 
@@ -30,6 +31,7 @@ type FileWriter struct {
 // been written.
 func (c *Client) Create(name string) (*FileWriter, error) {
 	_, err := c.getFileInfo(name)
+	err = interpretException(err)
 	if err == nil {
 		return nil, &os.PathError{"create", name, os.ErrExist}
 	} else if !os.IsNotExist(err) {
@@ -54,7 +56,7 @@ func (c *Client) CreateFile(name string, replication int, blockSize int64, perm 
 	createReq := &hdfs.CreateRequestProto{
 		Src:          proto.String(name),
 		Masked:       &hdfs.FsPermissionProto{Perm: proto.Uint32(uint32(perm))},
-		ClientName:   proto.String(c.namenode.ClientName()),
+		ClientName:   proto.String(c.namenode.ClientName),
 		CreateFlag:   proto.Uint32(1),
 		CreateParent: proto.Bool(false),
 		Replication:  proto.Uint32(uint32(replication)),
@@ -64,11 +66,7 @@ func (c *Client) CreateFile(name string, replication int, blockSize int64, perm 
 
 	err := c.namenode.Execute("create", createReq, createResp)
 	if err != nil {
-		if nnErr, ok := err.(*rpc.NamenodeError); ok {
-			err = interpretException(nnErr.Exception, err)
-		}
-
-		return nil, &os.PathError{"create", name, err}
+		return nil, &os.PathError{"create", name, interpretException(err)}
 	}
 
 	return &FileWriter{
@@ -84,50 +82,51 @@ func (c *Client) CreateFile(name string, replication int, blockSize int64, perm 
 // acknowledged asynchronously, it is very important that Close is called after
 // all data has been written.
 func (c *Client) Append(name string) (*FileWriter, error) {
-	info, err := c.getFileInfo(name)
+	_, err := c.getFileInfo(name)
 	if err != nil {
-		return nil, &os.PathError{"append", name, err}
+		return nil, &os.PathError{"append", name, interpretException(err)}
 	}
 
 	appendReq := &hdfs.AppendRequestProto{
 		Src:        proto.String(name),
-		ClientName: proto.String(c.namenode.ClientName()),
+		ClientName: proto.String(c.namenode.ClientName),
 	}
 	appendResp := &hdfs.AppendResponseProto{}
 
 	err = c.namenode.Execute("append", appendReq, appendResp)
 	if err != nil {
-		if nnErr, ok := err.(*rpc.NamenodeError); ok {
-			err = interpretException(nnErr.Exception, err)
-		}
-
-		return nil, &os.PathError{"append", name, err}
+		return nil, &os.PathError{"append", name, interpretException(err)}
 	}
 
-	req := &hdfs.GetBlockLocationsRequestProto{
-		Src:    proto.String(name),
-		Offset: proto.Uint64(0),
-		Length: proto.Uint64(uint64(info.Size())),
-	}
-	resp := &hdfs.GetBlockLocationsResponseProto{}
-
-	err = c.namenode.Execute("getBlockLocations", req, resp)
-	if err != nil {
-		return nil, err
-	}
-
-	blocks := resp.GetLocations().GetBlocks()
 	f := &FileWriter{
 		client:      c,
 		name:        name,
 		replication: int(appendResp.Stat.GetBlockReplication()),
 		blockSize:   int64(appendResp.Stat.GetBlocksize()),
 	}
-	if len(blocks) == 0 {
+
+	// This returns nil if there are no blocks (it's an empty file) or if the
+	// last block is full (so we have to start a fresh block).
+	block := appendResp.GetBlock()
+	if block == nil {
 		return f, nil
 	}
-	f.block = blocks[len(blocks)-1]
-	f.blockWriter = rpc.NewBlockWriter(f.block, c.namenode, f.blockSize)
+
+	f.blockWriter = &rpc.BlockWriter{
+		ClientName:          f.client.namenode.ClientName,
+		Block:               block,
+		BlockSize:           f.blockSize,
+		Offset:              int64(block.B.GetNumBytes()),
+		Append:              true,
+		UseDatanodeHostname: f.client.options.UseDatanodeHostname,
+		DialFunc:            f.client.options.DatanodeDialFunc,
+	}
+
+	err = f.blockWriter.SetDeadline(f.deadline)
+	if err != nil {
+		return nil, err
+	}
+
 	return f, nil
 }
 
@@ -140,6 +139,21 @@ func (c *Client) CreateEmptyFile(name string) error {
 	}
 
 	return f.Close()
+}
+
+// SetDeadline sets the deadline for future Write, Flush, and Close calls. A
+// zero value for t means those calls will not time out.
+//
+// Note that because of buffering, Write calls that do not result in a blocking
+// network call may still succeed after the deadline.
+func (f *FileWriter) SetDeadline(t time.Time) error {
+	f.deadline = t
+	if f.blockWriter != nil {
+		return f.blockWriter.SetDeadline(t)
+	}
+
+	// Return the error at connection time.
+	return nil
 }
 
 // Write implements io.Writer for writing to a file in HDFS. Internally, it
@@ -174,6 +188,21 @@ func (f *FileWriter) Write(b []byte) (int, error) {
 	return off, nil
 }
 
+// Flush flushes any buffered data out to the datanodes. Even immediately after
+// a call to Flush, it is still necessary to call Close once all data has been
+// written.
+func (f *FileWriter) Flush() error {
+	if f.closed {
+		return io.ErrClosedPipe
+	}
+
+	if f.blockWriter != nil {
+		return f.blockWriter.Flush()
+	}
+
+	return nil
+}
+
 // Close closes the file, writing any remaining data out to disk and waiting
 // for acknowledgements from the datanodes. It is important that Close is called
 // after all data has been written.
@@ -184,18 +213,18 @@ func (f *FileWriter) Close() error {
 
 	var lastBlock *hdfs.ExtendedBlockProto
 	if f.blockWriter != nil {
+		lastBlock = f.blockWriter.Block.GetB()
+
 		// Close the blockWriter, flushing any buffered packets.
-		err := f.blockWriter.Close()
+		err := f.finalizeBlock()
 		if err != nil {
 			return err
 		}
-
-		lastBlock = f.block.GetB()
 	}
 
 	completeReq := &hdfs.CompleteRequestProto{
 		Src:        proto.String(f.name),
-		ClientName: proto.String(f.client.namenode.ClientName()),
+		ClientName: proto.String(f.client.namenode.ClientName),
 		Last:       lastBlock,
 	}
 	completeResp := &hdfs.CompleteResponseProto{}
@@ -209,36 +238,61 @@ func (f *FileWriter) Close() error {
 }
 
 func (f *FileWriter) startNewBlock() error {
-	// TODO: we don't need to wait for previous blocks to ack before continuing
-
+	var previous *hdfs.ExtendedBlockProto
 	if f.blockWriter != nil {
-		err := f.blockWriter.Close()
+		previous = f.blockWriter.Block.GetB()
+
+		// TODO: We don't actually need to wait for previous blocks to ack before
+		// continuing.
+		err := f.finalizeBlock()
 		if err != nil {
 			return err
 		}
 	}
-	var previous *hdfs.ExtendedBlockProto
-	if f.block != nil {
-		previous = f.block.GetB()
-	}
 
 	addBlockReq := &hdfs.AddBlockRequestProto{
 		Src:        proto.String(f.name),
-		ClientName: proto.String(f.client.namenode.ClientName()),
+		ClientName: proto.String(f.client.namenode.ClientName),
 		Previous:   previous,
 	}
 	addBlockResp := &hdfs.AddBlockResponseProto{}
 
 	err := f.client.namenode.Execute("addBlock", addBlockReq, addBlockResp)
 	if err != nil {
-		if nnErr, ok := err.(*rpc.NamenodeError); ok {
-			err = interpretException(nnErr.Exception, err)
-		}
-
-		return &os.PathError{"create", f.name, err}
+		return &os.PathError{"create", f.name, interpretException(err)}
 	}
 
-	f.block = addBlockResp.GetBlock()
-	f.blockWriter = rpc.NewBlockWriter(f.block, f.client.namenode, f.blockSize)
+	f.blockWriter = &rpc.BlockWriter{
+		ClientName:          f.client.namenode.ClientName,
+		Block:               addBlockResp.GetBlock(),
+		BlockSize:           f.blockSize,
+		UseDatanodeHostname: f.client.options.UseDatanodeHostname,
+		DialFunc:            f.client.options.DatanodeDialFunc,
+	}
+
+	return f.blockWriter.SetDeadline(f.deadline)
+}
+
+func (f *FileWriter) finalizeBlock() error {
+	err := f.blockWriter.Close()
+	if err != nil {
+		return err
+	}
+
+	// Finalize the block on the namenode.
+	lastBlock := f.blockWriter.Block.GetB()
+	lastBlock.NumBytes = proto.Uint64(uint64(f.blockWriter.Offset))
+	updateReq := &hdfs.UpdateBlockForPipelineRequestProto{
+		Block:      lastBlock,
+		ClientName: proto.String(f.client.namenode.ClientName),
+	}
+	updateResp := &hdfs.UpdateBlockForPipelineResponseProto{}
+
+	err = f.client.namenode.Execute("updateBlockForPipeline", updateReq, updateResp)
+	if err != nil {
+		return err
+	}
+
+	f.blockWriter = nil
 	return nil
 }

@@ -1,13 +1,18 @@
 package main
 
 import (
-	"errors"
 	"fmt"
-	"os"
-
-	"github.com/yanchong/gohdfs"
 	"github.com/pborman/getopt"
+	"github.com/yanchong/gohdfs"
+	"github.com/yanchong/gohdfs/hadoopconf"
+	krb "gopkg.in/jcmturner/gokrb5.v5/client"
+	"gopkg.in/jcmturner/gokrb5.v5/config"
+	"gopkg.in/jcmturner/gokrb5.v5/keytab"
+	"net"
+	"os"
+	"os/user"
 	"strings"
+	"time"
 )
 
 // TODO: cp, tree, test, trash
@@ -75,8 +80,8 @@ Valid commands:
 	dfOpts = getopt.New()
 	dfh    = dfOpts.Bool('h')
 
-	cachedClient *hdfs.Client
-	status       = 0
+	cachedClients map[string]*hdfs.Client = make(map[string]*hdfs.Client)
+	status                                = 0
 )
 
 func init() {
@@ -170,25 +175,75 @@ func fatalWithUsage(msg ...interface{}) {
 	fatal(msg...)
 }
 
+func getClientNormal(userName string) (hdfs.ClientOptions, error) {
+	var options hdfs.ClientOptions
+	namenode := os.Getenv("HADOOP_NAMENODE")
+	if namenode != "" {
+		options.Addresses = strings.Split(namenode, "_")
+	}
+	options.User = userName
+	return options, nil
+}
+
+func getClientKerberos(userName string, hadoopConfDir string) (hdfs.ClientOptions, error) {
+	conf, err := hadoopconf.Load(hadoopConfDir)
+	var options hdfs.ClientOptions
+	if err != nil {
+		return options, err
+	}
+	options = hdfs.ClientOptionsFromConf(conf)
+	ktab, err := keytab.Load(hadoopConfDir + "/user.keytab")
+	if err != nil {
+		return options, err
+	}
+	kerberosClient := krb.NewClientWithKeytab(userName, "HADOOP.COM", ktab)
+	options.KerberosClient = &kerberosClient
+	options.KerberosClient.Config, err = config.Load(hadoopConfDir + "/krb5.conf")
+	if err != nil {
+		return options, err
+	}
+	err = options.KerberosClient.Login()
+	return options, err
+}
+
 func getClient(namenode string) (*hdfs.Client, error) {
-	if cachedClient != nil {
-		return cachedClient, nil
+	if cachedClients[namenode] != nil {
+		return cachedClients[namenode], nil
 	}
-
-	if namenode == "" {
-		namenode = os.Getenv("HADOOP_NAMENODE")
+	userName := os.Getenv("HADOOP_USER_NAME")
+	if userName == "" {
+		u, err := user.Current()
+		if err != nil {
+			return nil, err
+		}
+		userName = u.Username
 	}
-
-	if namenode == "" && os.Getenv("HADOOP_CONF_DIR") == "" {
-		return nil, errors.New("Couldn't find a namenode to connect to. You should specify hdfs://<namenode>:<port> in your paths. Alternatively, set HADOOP_NAMENODE or HADOOP_CONF_DIR in your environment.")
-	}
-
-	//c, err := hdfs.New(namenode)
-	c, err := hdfs.NewClient(hdfs.ClientOptions{Addresses: strings.Split(namenode, "_")})
+	options, err := getClientNormal(userName)
 	if err != nil {
 		return nil, err
 	}
+	hadoopConfDir := os.Getenv("HADOOP_CONF_DIR")
+	if hadoopConfDir == "" {
+		hadoopConfDir = "hdfs_conf"
+	}
+	if _, err := os.Stat(hadoopConfDir); !os.IsNotExist(err) {
+		options, err = getClientKerberos(userName, hadoopConfDir)
+		if err != nil {
+			return nil, err
+		}
+	}
 
-	cachedClient = c
-	return cachedClient, nil
+	dialFunc := (&net.Dialer{
+		Timeout:   300 * time.Second,
+		KeepAlive: 300 * time.Second,
+		DualStack: true,
+	}).DialContext
+	options.NamenodeDialFunc = dialFunc
+	options.DatanodeDialFunc = dialFunc
+	c, err := hdfs.NewClient(options)
+	if err != nil {
+		return nil, fmt.Errorf("Couldn't connect to namenode: %s", err)
+	}
+	cachedClients[namenode] = c
+	return c, nil
 }

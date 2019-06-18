@@ -20,7 +20,7 @@ func ls(paths []string, long, all, humanReadable bool) {
 	}
 
 	if len(paths) == 0 {
-		paths = []string{userDir()}
+		paths = []string{userDir(client)}
 	}
 
 	files := make([]string, 0, len(paths))
@@ -57,7 +57,7 @@ func ls(paths []string, long, all, humanReadable bool) {
 		}
 
 		for i, dir := range dirs {
-			if i > 0 {
+			if i > 0 || len(files) > 0 {
 				fmt.Println()
 			}
 

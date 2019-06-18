@@ -4,8 +4,7 @@ import (
 	"os"
 	"path"
 
-	hdfs "github.com/yanchong/gohdfs/protocol/hadoop_hdfs"
-	"github.com/yanchong/gohdfs/rpc"
+	hdfs "github.com/yanchong/gohdfs/internal/protocol/hadoop_hdfs"
 	"github.com/golang/protobuf/proto"
 )
 
@@ -26,10 +25,12 @@ func (c *Client) mkdir(dirname string, perm os.FileMode, createParent bool) erro
 	dirname = path.Clean(dirname)
 
 	info, err := c.getFileInfo(dirname)
+	err = interpretException(err)
 	if err == nil {
 		if createParent && info.IsDir() {
 			return nil
 		}
+
 		return &os.PathError{"mkdir", dirname, os.ErrExist}
 	} else if !os.IsNotExist(err) {
 		return &os.PathError{"mkdir", dirname, err}
@@ -44,11 +45,7 @@ func (c *Client) mkdir(dirname string, perm os.FileMode, createParent bool) erro
 
 	err = c.namenode.Execute("mkdirs", req, resp)
 	if err != nil {
-		if nnErr, ok := err.(*rpc.NamenodeError); ok {
-			err = interpretException(nnErr.Exception, err)
-		}
-
-		return &os.PathError{"mkdir", dirname, err}
+		return &os.PathError{"mkdir", dirname, interpretException(err)}
 	}
 
 	return nil

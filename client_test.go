@@ -1,58 +1,126 @@
 package hdfs
 
 import (
+	"fmt"
 	"io/ioutil"
 	"os"
+	"os/user"
 	"path/filepath"
 	"testing"
 
+	"github.com/yanchong/gohdfs/hadoopconf"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	krb "gopkg.in/jcmturner/gokrb5.v5/client"
+	"gopkg.in/jcmturner/gokrb5.v5/config"
+	"gopkg.in/jcmturner/gokrb5.v5/credentials"
 )
 
 var cachedClients = make(map[string]*Client)
 
 func getClient(t *testing.T) *Client {
-	username, err := Username()
+	return getClientForUser(t, "gohdfs1")
+}
+
+func getClientForSuperUser(t *testing.T) *Client {
+	u, err := user.Current()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	return getClientForUser(t, username)
+	return getClientForUser(t, u.Username)
 }
 
-func getClientForUser(t *testing.T, user string) *Client {
-	if c, ok := cachedClients[user]; ok {
+func getClientForUser(t *testing.T, username string) *Client {
+	if c, ok := cachedClients[username]; ok {
 		return c
 	}
 
-	nn := os.Getenv("HADOOP_NAMENODE")
-	if nn == "" {
-		t.Fatal("HADOOP_NAMENODE not set")
+	conf, err := hadoopconf.LoadFromEnvironment()
+	if err != nil || conf == nil {
+		t.Fatal("Couldn't load ambient config", err)
 	}
 
-	client, err := NewForUser(nn, user)
+	options := ClientOptionsFromConf(conf)
+	if options.Addresses == nil {
+		t.Fatal("Missing namenode addresses in ambient config")
+	}
+
+	if options.KerberosClient != nil {
+		options.KerberosClient = getKerberosClient(t, username)
+	} else {
+		options.User = username
+	}
+
+	client, err := NewClient(options)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	cachedClients[user] = client
+	cachedClients[username] = client
 	return client
 }
 
+// getKerberosClient expects a ccache file for each user mentioned in the tests
+// to live at /tmp/krb5cc_gohdfs_<username>, and krb5.conf to live at
+// /etc/krb5.conf
+func getKerberosClient(t *testing.T, username string) *krb.Client {
+	cfg, err := config.Load("/etc/krb5.conf")
+	if err != nil {
+		t.Skip("Couldn't load krb config:", err)
+	}
+
+	ccache, err := credentials.LoadCCache(fmt.Sprintf("/tmp/krb5cc_gohdfs_%s", username))
+	if err != nil {
+		t.Skipf("Couldn't load keytab for user %s: %s", username, err)
+	}
+
+	client, err := krb.NewClientFromCCache(ccache)
+	if err != nil {
+		t.Fatal("Couldn't initialize krb client:", err)
+	}
+
+	return client.WithConfig(cfg)
+}
+
 func touch(t *testing.T, path string) {
+	touchMask(t, path, 0)
+}
+
+func touchMask(t *testing.T, path string, mask os.FileMode) {
 	c := getClient(t)
 
-	err := c.CreateEmptyFile(path)
+	err := c.RemoveAll(path)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+
+	err = c.CreateEmptyFile(path)
 	if err != nil && !os.IsExist(err) {
 		t.Fatal(err)
+	}
+
+	if mask != 0 {
+		err = c.Chmod(path, mask)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
 func mkdirp(t *testing.T, path string) {
+	mkdirpMask(t, path, 0755)
+}
+
+func mkdirpMask(t *testing.T, path string, mask os.FileMode) {
 	c := getClient(t)
 
-	err := c.MkdirAll(path, 0644)
+	err := c.RemoveAll(path)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+
+	err = c.MkdirAll(path, mask)
 	if err != nil && !os.IsExist(err) {
 		t.Fatal(err)
 	}
@@ -61,7 +129,7 @@ func mkdirp(t *testing.T, path string) {
 func baleet(t *testing.T, path string) {
 	c := getClient(t)
 
-	err := c.Remove(path)
+	err := c.RemoveAll(path)
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)
 	}
@@ -76,18 +144,20 @@ func assertPathError(t *testing.T, err error, op, path string, wrappedErr error)
 }
 
 func TestNewWithMultipleNodes(t *testing.T) {
-	nn := os.Getenv("HADOOP_NAMENODE")
-	if nn == "" {
-		t.Fatal("HADOOP_NAMENODE not set")
+	conf, err := hadoopconf.LoadFromEnvironment()
+	if err != nil {
+		t.Fatal("Couldn't load ambient config", err)
 	}
-	_, err := NewClient(ClientOptions{
-		Addresses: []string{"localhost:80", nn},
-	})
+
+	nns := conf.Namenodes()
+
+	nns = append([]string{"localhost:100"}, nns...)
+	_, err = NewClient(ClientOptions{Addresses: nns, User: "gohdfs1"})
 	assert.Nil(t, err)
 }
 
 func TestNewWithFailingNode(t *testing.T) {
-	_, err := New("localhost:80")
+	_, err := New("localhost:100")
 	assert.NotNil(t, err)
 }
 
@@ -118,7 +188,7 @@ func TestCopyToRemote(t *testing.T) {
 	client := getClient(t)
 
 	baleet(t, "/_test/copytoremote.txt")
-	err := client.CopyToRemote("test/foo.txt", "/_test/copytoremote.txt")
+	err := client.CopyToRemote("testdata/foo.txt", "/_test/copytoremote.txt")
 	require.NoError(t, err)
 
 	bytes, err := client.ReadFile("/_test/copytoremote.txt")

@@ -23,6 +23,8 @@ var knownCommands = []string{
 	"checksum",
 	"get",
 	"getmerge",
+	"put",
+	"df",
 }
 
 func complete(args []string) {
@@ -31,11 +33,23 @@ func complete(args []string) {
 
 		if len(words) <= 1 {
 			fmt.Println(strings.Join(knownCommands, " "))
-		} else {
-			completePath(words[len(words)-1])
+		} else if isKnownCommand(words[0]) {
+			position := countPosition(words)
+			completeArg(words[0], words[len(words)-1], position)
 		}
 	} else {
 		fmt.Println(strings.Join(knownCommands, " "))
+	}
+}
+
+func completeArg(command, fragment string, position int) {
+	if (command == "put" && position == 1) ||
+		((command == "get" || command == "getmerge") && position == 2) {
+		fmt.Println("_FILE_") // The bash_completion bit knows about this special string.
+	} else if (command == "chmod" || command == "chown") && position == 1 {
+		return
+	} else if !strings.HasPrefix(fragment, "-") {
+		completePath(fragment)
 	}
 }
 
@@ -45,13 +59,15 @@ func completePath(fragment string) {
 		return
 	}
 
-	fullPath := paths[0]
-	if hasGlob(fullPath) {
+	client, err := getClient(namenode)
+	if err != nil {
 		return
 	}
 
-	client, err := getClient(namenode)
-	if err != nil {
+	fullPath := paths[0]
+	if fullPath == "" {
+		fullPath = userDir(client) + "/"
+	} else if hasGlob(fullPath) {
 		return
 	}
 
@@ -68,8 +84,10 @@ func completePath(fragment string) {
 		return
 	}
 
+	// 1000 entries should align with what HDFS returns. If not, well, it was
+	// going to be slow anyway.
 	var partial []os.FileInfo
-	for ; err != io.EOF; partial, err = dirReader.Readdir(100) {
+	for ; err != io.EOF; partial, err = dirReader.Readdir(1000) {
 		if err != nil {
 			return
 		}
@@ -89,4 +107,24 @@ func completePath(fragment string) {
 	}
 
 	fmt.Println()
+}
+
+func isKnownCommand(command string) bool {
+	for _, c := range knownCommands {
+		if command == c {
+			return true
+		}
+	}
+	return false
+}
+
+func countPosition(words []string) int {
+	var position int
+	for _, w := range words {
+		if !strings.HasPrefix(w, "-") {
+			position++
+		}
+	}
+
+	return position - 1
 }
