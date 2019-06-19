@@ -4,14 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
-	"sync"
-	"time"
-
-	hadoop "github.com/yanchong/gohdfs/internal/protocol/hadoop_common"
 	"github.com/golang/protobuf/proto"
+	hadoop "github.com/yanchong/gohdfs/internal/protocol/hadoop_common"
 	krb "gopkg.in/jcmturner/gokrb5.v5/client"
 	krbtypes "gopkg.in/jcmturner/gokrb5.v5/types"
+	"net"
+	"os"
+	"sync"
+	"time"
 )
 
 const (
@@ -142,34 +142,44 @@ func (c *NamenodeConnection) resolveConnection() error {
 		err = c.host.lastError
 	}
 
-	for _, host := range c.hostList {
-		if host.lastErrorAt.After(time.Now().Add(-backoffDuration)) {
-			continue
-		}
+	i := 1
+	for i <= 1000 {
+		for _, host := range c.hostList {
+			if host.lastErrorAt.After(time.Now().Add(-backoffDuration)) {
+				continue
+			}
 
-		if c.dialFunc == nil {
-			c.dialFunc = (&net.Dialer{}).DialContext
-		}
+			if c.dialFunc == nil {
+				c.dialFunc = (&net.Dialer{}).DialContext
+			}
 
-		c.host = host
-		c.conn, err = c.dialFunc(context.Background(), "tcp", host.address)
-		if err != nil {
-			c.markFailure(err)
-			continue
-		}
+			c.host = host
+			c.conn, err = c.dialFunc(context.Background(), "tcp", host.address)
+			if err != nil {
+				c.markFailure(err)
+				continue
+			}
 
-		err = c.doNamenodeHandshake()
-		if err != nil {
-			c.markFailure(err)
-			continue
-		}
+			err = c.doNamenodeHandshake()
+			if err != nil {
+				c.markFailure(err)
+				continue
+			}
 
-		break
+			break
+		}
+		if c.conn != nil {
+			break
+		}
+		os.Stderr.WriteString(fmt.Sprintf("count: %d no available namenodes: %s\n", i, err.Error()))
+		time.Sleep(time.Duration(i) * time.Second)
+		i++
 	}
-
 	if c.conn == nil {
+		os.Stderr.WriteString(fmt.Sprintf("count: %d namenode err\n", i))
 		return fmt.Errorf("no available namenodes: %s", err)
 	}
+	os.Stderr.WriteString(fmt.Sprintf("count: %d namenode ok\n", i))
 
 	return nil
 }

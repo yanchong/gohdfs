@@ -227,15 +227,26 @@ func getClient(namenode string) (*hdfs.Client, error) {
 		hadoopConfDir = "hdfs_conf"
 	}
 	if _, err := os.Stat(hadoopConfDir); !os.IsNotExist(err) {
-		options, err = getClientKerberos(userName, hadoopConfDir)
+		i := 1
+		for i <= 1000 {
+			options, err = getClientKerberos(userName, hadoopConfDir)
+			if err == nil {
+				break
+			}
+			os.Stderr.WriteString(fmt.Sprintf("count: %d %s\n", i, err.Error()))
+			time.Sleep(time.Duration(i) * time.Second)
+			i++
+		}
 		if err != nil {
 			return nil, err
 		}
+		os.Stderr.WriteString(fmt.Sprintf("count: %d get kerberos client ok\n", i))
 	}
 
 	dialFunc := (&net.Dialer{
-		Timeout:   300 * time.Second,
-		KeepAlive: 300 * time.Second,
+		Timeout:   300000 * time.Second,
+		KeepAlive: 300000 * time.Second,
+		Deadline:  time.Now().Add(300000 * time.Second),
 		DualStack: true,
 	}).DialContext
 	options.NamenodeDialFunc = dialFunc
