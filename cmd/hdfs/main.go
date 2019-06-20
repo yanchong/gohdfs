@@ -222,10 +222,8 @@ func getClient(namenode string) (*hdfs.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	hadoopConfDir := os.Getenv("HADOOP_CONF_DIR")
-	if hadoopConfDir == "" {
-		hadoopConfDir = "hdfs_conf"
-	}
+	// For only check of kerberos is hdfs_conf dir
+	hadoopConfDir := "hdfs_conf"
 	if _, err := os.Stat(hadoopConfDir); !os.IsNotExist(err) {
 		i := 1
 		for i <= 1000 {
