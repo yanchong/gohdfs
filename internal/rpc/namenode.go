@@ -179,7 +179,6 @@ func (c *NamenodeConnection) resolveConnection() error {
 		os.Stderr.WriteString(fmt.Sprintf("count: %d namenode err\n", i))
 		return fmt.Errorf("no available namenodes: %s", err)
 	}
-	os.Stderr.WriteString(fmt.Sprintf("count: %d namenode ok\n", i))
 
 	return nil
 }

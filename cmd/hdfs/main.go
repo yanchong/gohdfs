@@ -240,7 +240,6 @@ func getClient(namenode string) (*hdfs.Client, error) {
 		if err != nil {
 			return nil, err
 		}
-		os.Stderr.WriteString(fmt.Sprintf("count: %d get kerberos client ok\n", i))
 	}
 
 	dialFunc := (&net.Dialer{
