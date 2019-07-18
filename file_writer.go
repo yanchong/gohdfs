@@ -5,9 +5,9 @@ import (
 	"os"
 	"time"
 
+	"github.com/golang/protobuf/proto"
 	hdfs "github.com/yanchong/gohdfs/internal/protocol/hadoop_hdfs"
 	"github.com/yanchong/gohdfs/internal/rpc"
-	"github.com/golang/protobuf/proto"
 )
 
 // A FileWriter represents a writer for an open file in HDFS. It implements
@@ -22,6 +22,8 @@ type FileWriter struct {
 	blockWriter *rpc.BlockWriter
 	deadline    time.Time
 	closed      bool
+	buf         []byte
+	bufOffset   int
 }
 
 // Create opens a new file in HDFS with the default replication, block size,
@@ -171,21 +173,74 @@ func (f *FileWriter) Write(b []byte) (int, error) {
 			return 0, err
 		}
 	}
+	bSize := int(f.blockWriter.BlockSize)
+	if f.buf == nil {
+		f.buf = make([]byte, bSize)
+		f.bufOffset = 0
+	}
+	left := 0
+	if f.bufOffset+len(b) <= bSize {
+		i := 0
+		for i < len(b) {
+			f.buf[f.bufOffset+i] = b[i]
+			i++
+		}
+		f.bufOffset += len(b)
+		left = len(b)
+	} else {
+		left = bSize - f.bufOffset
+		i := 0
+		for i < left {
+			f.buf[f.bufOffset+i] = b[i]
+			i++
+		}
+		f.bufOffset = bSize
+	}
+	if left > bSize {
+		panic("should not here")
+	}
+	if f.bufOffset < bSize {
+		return len(b), nil
+	}
 
 	off := 0
-	for off < len(b) {
-		n, err := f.blockWriter.Write(b[off:])
+	for off < f.bufOffset {
+		n, err := f.blockWriter.Write(f.buf[off:f.bufOffset])
+		if n == bSize {
+			f.blockWriter.Close()
+		}
 		off += n
 		if err == rpc.ErrEndOfBlock {
 			err = f.startNewBlock()
 		}
-
 		if err != nil {
 			return off, err
 		}
 	}
+	i := 0
+	for left+i < len(b) {
+		f.buf[i] = b[left+i]
+		i++
+	}
+	f.bufOffset = len(b) - left
 
-	return off, nil
+	return len(b), nil
+}
+
+func (f *FileWriter) FlushLeft() error {
+	off := 0
+	for off < f.bufOffset {
+		n, err := f.blockWriter.Write(f.buf[off:f.bufOffset])
+		off += n
+		if err == rpc.ErrEndOfBlock {
+			err = f.startNewBlock()
+		}
+		if err != nil {
+			return err
+		}
+	}
+	f.bufOffset = 0
+	return nil
 }
 
 // Flush flushes any buffered data out to the datanodes. Even immediately after
@@ -195,8 +250,8 @@ func (f *FileWriter) Flush() error {
 	if f.closed {
 		return io.ErrClosedPipe
 	}
-
 	if f.blockWriter != nil {
+		f.FlushLeft()
 		return f.blockWriter.Flush()
 	}
 
@@ -209,6 +264,9 @@ func (f *FileWriter) Flush() error {
 func (f *FileWriter) Close() error {
 	if f.closed {
 		return io.ErrClosedPipe
+	}
+	if f.blockWriter != nil {
+		f.FlushLeft()
 	}
 
 	var lastBlock *hdfs.ExtendedBlockProto
