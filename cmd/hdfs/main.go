@@ -175,6 +175,14 @@ func fatalWithUsage(msg ...interface{}) {
 	fatal(msg...)
 }
 
+func findRealm(krbConf *config.Config) string {
+	realm := krbConf.LibDefaults.DefaultRealm
+	if realm != "" {
+		return realm
+	}
+	return "HADOOP.COM"
+}
+
 func getClientNormal(userName string) (hdfs.ClientOptions, error) {
 	var options hdfs.ClientOptions
 	namenode := os.Getenv("HADOOP_NAMENODE")
@@ -196,12 +204,14 @@ func getClientKerberos(userName string, hadoopConfDir string) (hdfs.ClientOption
 	if err != nil {
 		return options, err
 	}
-	kerberosClient := krb.NewClientWithKeytab(userName, "HADOOP.COM", ktab)
-	options.KerberosClient = &kerberosClient
-	options.KerberosClient.Config, err = config.Load(hadoopConfDir + "/krb5.conf")
+	krbConf, err := config.Load(hadoopConfDir + "/krb5.conf")
 	if err != nil {
 		return options, err
 	}
+	realm := findRealm(krbConf)
+	kerberosClient := krb.NewClientWithKeytab(userName, realm, ktab)
+	options.KerberosClient = &kerberosClient
+	options.KerberosClient.Config = krbConf
 	err = options.KerberosClient.Login()
 	return options, err
 }
